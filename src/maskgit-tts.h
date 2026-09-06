@@ -359,6 +359,19 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
     fprintf(stderr, "[MaskGIT] Total LM forward: %.2f ms across %d steps (avg %.2f ms/step)\n", fwd_total_ms,
             cfg.num_step, fwd_total_ms / (double) cfg.num_step);
 
+    if (getenv("OMNIVOICE_STEP_STATS") != nullptr && batched_ctx.lm_n_compute > 0) {
+        double tot = batched_ctx.lm_ms_upload + batched_ctx.lm_ms_compute + batched_ctx.lm_ms_readback;
+        fprintf(stderr,
+                "[MaskGIT-StepStats] steps=%d upload_total=%.1f compute_total=%.1f readback_total=%.1f "
+                "sum_total=%.1f | per-step upload=%.2f compute=%.2f readback=%.2f (sum=%.2f) | fwd_total=%.1f\n",
+                batched_ctx.lm_n_compute, batched_ctx.lm_ms_upload, batched_ctx.lm_ms_compute,
+                batched_ctx.lm_ms_readback, tot,
+                batched_ctx.lm_ms_upload / batched_ctx.lm_n_compute,
+                batched_ctx.lm_ms_compute / batched_ctx.lm_n_compute,
+                batched_ctx.lm_ms_readback / batched_ctx.lm_n_compute,
+                tot / batched_ctx.lm_n_compute, fwd_total_ms);
+    }
+
     if (ctr_lo_inout != nullptr) {
         *ctr_lo_inout = ctr_lo;
     }

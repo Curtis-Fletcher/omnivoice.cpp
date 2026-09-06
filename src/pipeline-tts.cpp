@@ -329,6 +329,10 @@ void pipeline_tts_llm_batched_ctx_init(MaskgitBatchedCtx * ctx,
     ctx->audio_mask_raw = audio_mask;
     ctx->attn_mask_raw  = attention_mask;
     ctx->has_attn_mask  = (attention_mask != NULL);
+    ctx->lm_ms_upload   = 0.0;
+    ctx->lm_ms_compute  = 0.0;
+    ctx->lm_ms_readback = 0.0;
+    ctx->lm_n_compute   = 0;
 
     ctx->mask_f.resize((size_t) B_prime * (size_t) S);
     ctx->inv_mask_f.resize((size_t) B_prime * (size_t) S);
@@ -616,10 +620,13 @@ std::vector<float> pipeline_tts_llm_forward_batched(PipelineTTS *       pt,
         }
     }
 
+    const bool step_stats = getenv("OMNIVOICE_STEP_STATS") != nullptr;
+
     // Mutable token ids upload every step. A direct graph pins the masks and
     // positions through their output flag, so they bake once at build; the
     // scheduler fallback refreshes them because its input buffers may be
     // reused as scratch between computes.
+    Timer t_up;
     ggml_backend_tensor_set(ctx->lm_text_ids, text_ids_buf.data(), 0, (size_t) B_prime * (size_t) S * sizeof(int32_t));
     ggml_backend_tensor_set(ctx->lm_shifted, shifted.data(), 0,
                             (size_t) K * (size_t) B_prime * (size_t) S * sizeof(int32_t));
@@ -633,14 +640,23 @@ std::vector<float> pipeline_tts_llm_forward_batched(PipelineTTS *       pt,
                                     (size_t) B_prime * (size_t) S * (size_t) S * sizeof(uint16_t));
         }
     }
+    const double ms_upload = t_up.ms();
 
+    Timer t_comp;
     // The graph and its allocation persist across MaskGIT steps.
     enum ggml_status st = static_graph_compute(&ctx->lm_graph, pt->backend, pt->sched, ctx->lm_gf);
+    const double ms_compute = t_comp.ms();
     if (st != GGML_STATUS_SUCCESS) {
         ov_log(OV_LOG_ERROR, "[LM-Forward-Batched] graph_compute status=%d", (int) st);
+        if (step_stats) {
+            ov_log(OV_LOG_INFO,
+                   "[LM-StepStats] upload=%.2f compute=%.2f readback=n/a (failed st=%d, n=%d)",
+                   ms_upload, ms_compute, (int) st, ctx->lm_n_compute);
+        }
         return {};
     }
 
+    Timer t_rb;
     std::vector<float> out;
     if (T_audio > 0) {
         const size_t per_audio = (size_t) V * (size_t) K * (size_t) T_audio;
@@ -651,6 +667,16 @@ std::vector<float> pipeline_tts_llm_forward_batched(PipelineTTS *       pt,
         const size_t n = ggml_nelements(ctx->lm_logits);
         out.resize(n);
         ggml_backend_tensor_get(ctx->lm_logits, out.data(), 0, n * sizeof(float));
+    }
+    const double ms_readback = t_rb.ms();
+
+    if (step_stats) {
+        ctx->lm_ms_upload += ms_upload;
+        ctx->lm_ms_compute += ms_compute;
+        ctx->lm_ms_readback += ms_readback;
+        ctx->lm_n_compute++;
+        ov_log(OV_LOG_INFO, "[LM-StepStats] step=%d upload=%.2f compute=%.2f readback=%.2f total=%.2f",
+               ctx->lm_n_compute, ms_upload, ms_compute, ms_readback, ms_upload + ms_compute + ms_readback);
     }
 
     return out;

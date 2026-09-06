@@ -110,6 +110,14 @@ struct MaskgitBatchedCtx {
     int                   lm_key_K       = 0;
     int                   lm_key_T_audio = -1;
     bool                  lm_built       = false;
+
+    // Per-phase timing accumulators for the batched forward (host upload,
+    // graph compute, D2H readback). Filled when OMNIVOICE_STEP_STATS is set;
+    // reset by ctx_init. ms, summed over the replay steps of one request.
+    double lm_ms_upload    = 0.0;
+    double lm_ms_compute   = 0.0;
+    double lm_ms_readback  = 0.0;
+    int    lm_n_compute    = 0;
 };
 
 // Pre-compute the batched context from the prompt buffers. The original
