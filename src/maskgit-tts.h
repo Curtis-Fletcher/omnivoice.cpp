@@ -18,6 +18,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
+#include <thread>
 #include <vector>
 
 struct MaskgitConfig {
@@ -127,6 +129,41 @@ static void maskgit_gumbel_inplace(float * x, int n, float temperature, int64_t 
     ctr_lo += 1;
 }
 
+// Parallel-for over N slot indices with a small pool of worker threads.
+// Each slot's work must be independent (no shared mutable state across
+// iterations). Threads are created once and reused; the pool is capped at
+// 6 workers (matches the ggml CPU backend thread count). OMNIVOICE_SERIAL
+// forces the serial path for A/B comparisons.
+static void maskgit_parallel_for(int n, const std::function<void(int, int)> & fn) {
+    static const bool serial = getenv("OMNIVOICE_SERIAL") != nullptr;
+    if (serial || n < 1) {
+        fn(0, n);
+        return;
+    }
+    static const int n_threads = []() {
+        int hw = (int) std::thread::hardware_concurrency();
+        return std::max(1, std::min(6, hw / 2));
+    }();
+    if (n_threads <= 1 || n < 64) {
+        fn(0, n);
+        return;
+    }
+    const int      chunk = (n + n_threads - 1) / n_threads;
+    std::vector<std::thread> workers;
+    workers.reserve((size_t) n_threads);
+    for (int t = 0; t < n_threads; t++) {
+        const int begin = t * chunk;
+        const int end   = std::min(n, begin + chunk);
+        if (begin >= end) {
+            break;
+        }
+        workers.emplace_back(fn, begin, end);
+    }
+    for (auto & w : workers) {
+        w.join();
+    }
+}
+
 // Run the iterative decoder. Returns flat audio_tokens of size K * T (k slow,
 // t fast). The prompt input_ids buffer is mutated in place during decoding.
 // ctr_lo_inout, when non-NULL, threads the Philox counter across successive
@@ -210,15 +247,18 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
         std::vector<float> u_log((size_t) K * (size_t) T * (size_t) V);
         const float *      src_cond = audio_only ? logits_full.data() : logits_full.data() + 0 * per_full_item;
         const float * src_uncond = audio_only ? logits_full.data() + per_audio : logits_full.data() + 1 * per_full_item;
-        for (int k = 0; k < K; k++) {
-            for (int t = 0; t < T; t++) {
+        const int n_slots = K * T;
+        maskgit_parallel_for(n_slots, [&](int b, int e) {
+            for (int i = b; i < e; i++) {
+                int k = i / T;
+                int t = i % T;
                 size_t cond_off = audio_only ? ((size_t) t * K + k) * V : ((size_t) (audio_start_cond + t) * K + k) * V;
                 size_t uncond_off = ((size_t) t * K + k) * V;
                 size_t dst_off    = ((size_t) k * T + t) * V;
                 std::copy(src_cond + cond_off, src_cond + cond_off + V, c_log.begin() + dst_off);
                 std::copy(src_uncond + uncond_off, src_uncond + uncond_off + V, u_log.begin() + dst_off);
             }
-        }
+        });
 
         // Dump LM logits at step 0 only, layout [K, T, V] for both cond and
         // uncond rows. The Python side mirrors this layout via a hook on
@@ -233,12 +273,14 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
         // CFG + log_softmax pipeline. Result shape [K, T, V].
         // log_probs[v] = log_softmax(c_log_softmax + g * (c_log_softmax - u_log_softmax)).
         std::vector<float> log_probs((size_t) K * (size_t) T * (size_t) V);
-        for (int k = 0; k < K; k++) {
-            for (int t = 0; t < T; t++) {
+        maskgit_parallel_for(n_slots, [&](int b, int e) {
+            for (int i = b; i < e; i++) {
+                int     k  = i / T;
+                int     t  = i % T;
                 size_t  off = ((size_t) k * T + t) * V;
-                float * c   = c_log.data() + off;
-                float * u   = u_log.data() + off;
-                float * lp  = log_probs.data() + off;
+                float * c  = c_log.data() + off;
+                float * u  = u_log.data() + off;
+                float * lp = log_probs.data() + off;
 
                 if (cfg.guidance_scale != 0.0f) {
                     maskgit_log_softmax_inplace(c, V);
@@ -255,29 +297,60 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
                 }
                 lp[mask_id] = -INFINITY;
             }
-        }
+        });
 
-        // Predict tokens + confidence per (k, t).
+        // Predict tokens + confidence per (k, t). The greedy path (class
+        // temperature 0, the production config) is per-slot independent and
+        // parallelized; the temperature>0 path mutates shared ctr_lo in the
+        // gumbel step and stays serial to preserve the RNG sequence.
         std::vector<int32_t> pred_tokens((size_t) K * (size_t) T);
         std::vector<float>   confidence((size_t) K * (size_t) T);
-        for (int k = 0; k < K; k++) {
-            for (int t = 0; t < T; t++) {
+        const bool           greedy_predict = cfg.class_temperature <= 0.0f;
+        assert(n_slots > 0);
+        if (greedy_predict) {
+            maskgit_parallel_for(n_slots, [&](int b, int e) {
+                for (int i = b; i < e; i++) {
+                    int     k  = i / T;
+                    int     t  = i % T;
+                    size_t  off = ((size_t) k * T + t) * V;
+                    float * lp  = log_probs.data() + off;
+
+                    int   best_v = 0;
+                    float best   = lp[0];
+                    for (int v = 1; v < V; v++) {
+                        if (lp[v] > best) {
+                            best   = lp[v];
+                            best_v = v;
+                        }
+                    }
+                    pred_tokens[(size_t) k * T + t] = best_v;
+
+                    float max_lp = lp[0];
+                    for (int v = 1; v < V; v++) {
+                        if (lp[v] > max_lp) {
+                            max_lp = lp[v];
+                        }
+                    }
+                    confidence[(size_t) k * T + t] = max_lp;
+                }
+            });
+        } else {
+            // Temperature > 0: the gumbel step mutates the shared ctr_lo,
+            // so this must stay serial to preserve the RNG sequence.
+            for (int i = 0; i < n_slots; i++) {
+                int     k  = i / T;
+                int     t  = i % T;
                 size_t  off = ((size_t) k * T + t) * V;
                 float * lp  = log_probs.data() + off;
 
-                std::vector<float> work;
-                float *            sample_src = lp;
-                if (cfg.class_temperature > 0.0f) {
-                    work.assign(lp, lp + V);
-                    maskgit_top_k_filter_inplace(work.data(), V, 0.1f);
-                    maskgit_gumbel_inplace(work.data(), V, cfg.class_temperature, (int64_t) cfg.seed, ctr_lo);
-                    sample_src = work.data();
-                }
+                std::vector<float> work(lp, lp + V);
+                maskgit_top_k_filter_inplace(work.data(), V, 0.1f);
+                maskgit_gumbel_inplace(work.data(), V, cfg.class_temperature, (int64_t) cfg.seed, ctr_lo);
                 int   best_v = 0;
-                float best   = sample_src[0];
+                float best   = work[0];
                 for (int v = 1; v < V; v++) {
-                    if (sample_src[v] > best) {
-                        best   = sample_src[v];
+                    if (work[v] > best) {
+                        best   = work[v];
                         best_v = v;
                     }
                 }
